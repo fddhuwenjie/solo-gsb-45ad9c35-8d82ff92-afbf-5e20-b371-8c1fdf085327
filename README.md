@@ -2,8 +2,9 @@
 
 仅用 **Python 标准库**（`http.server` + `sqlite3`）实现的木构件修复验收服务。
 登记固定支承点、承重构件（含最低试载值）、榫卯连接、临时支撑与替换件；
-按递增工序号提交拆卸 / 安装 / 试载 / 卸撑回执；每个工序重建当前连接图并做结构校验；
+按递增工序号提交拆卸 / 安装 / 试载 / 卸撑 / 事故上报回执；每个工序重建当前连接图并做结构校验；
 支持整单工序的施工预案（预演 + 服务端密钥签发的凭据确认，写事务内验签并复核）；
+已在位榫卯意外失效时可沿工序顺序上报事故，保存真实连接状态并逐步补救消险；
 卸撑完成后可固化不可改写的验收快照。
 
 ## 启动
@@ -54,6 +55,19 @@ docker compose up --build
   （连接或临时支撑）检查。保护/解除不递增连接状态版本、不使试载失效，但纳入预案
   凭据指纹——预演后的保护变化使旧凭据失效（409 `plan_stale`）；快照附 `protections`
   字段固化当时保护对象。
+- **事故上报与补救**：现场发现已在位榫卯意外失效时，经 `report_failure` 工序
+  （占用连续工序号）上报：断开该连接并**保存真实连接状态与回执**——即使断开后
+  有构件失去施工期路径、或受保护构件失去永久路径，也不做整步回滚；受影响构件
+  **按登记序**记入事故名单（持久保存于 SQLite，旧库启动自动建空表，默认无事故；
+  重启后事故状态仍在），`/state` 以顶层 `incident` 与各构件的 `affected` 字段
+  展示。断开使连接状态版本 +1——**旧试载全部失效**，登记/工序状态变化同时使
+  **旧预案凭据失效**（409 `plan_stale`）。**一次只处理一处失效**：未消险时只允许
+  安装事先登记的连接或临时支撑（补救工序），每步受影响名单**不得新增成员**
+  （409 `incident_widened`）、可逐步救回；**受保护构件只能靠永久连接恢复**
+  （临时支撑不能将其移出名单）。名单清空即消险，事故结束、恢复通常工序。
+  未消险期间试载、卸撑与验收快照一律 409 `incident_active` 拒绝，**拒绝不改
+  状态或工序号**；补救安装也可列入预案清单走预演/确认，逐步遵守同一规则，
+  失败仍整单回滚。已有快照与正常工序保持可用。
 - **整步拒绝**：跳号、端点不在位、可达性或卸撑条件不满足时返回 409，
   响应含 `first_affected_component`（首个受影响构件），已有回执与状态不变。
 - **施工预案（预演 / 确认）**：`POST /plan/preview` 按现有单步字段提交从末条回执后
@@ -82,11 +96,11 @@ docker compose up --build
 | POST | `/replacements` | 登记替换件 `{id, name, min_load}`（初始不在位） |
 | POST | `/connections` | 登记榫卯连接 `{id, a, b, in_place?}`（默认 true；改接预留组合传 false） |
 | POST | `/temp-supports` | 登记临时支撑 `{id, a, b, in_place?}`（默认 false） |
-| POST | `/steps` | 提交工序回执（含支承点停用/启用、连续传力保护/解除，见下） |
+| POST | `/steps` | 提交工序回执（含支承点停用/启用、连续传力保护/解除、事故上报，见下） |
 | POST | `/plan/preview` | 预演工序清单：整单成功后签发服务端密钥保护的凭据（不留改动） |
 | POST | `/plan/confirm` | 凭据确认：写事务内验签并复核整单，凭据整单仅可用一次 |
 | GET | `/steps`、`/steps/{seq}` | 查询各工序回执与结果 |
-| GET | `/state` | 当前连接图、各构件可达性与最近试载、各支承点检修状态、连续传力保护对象 |
+| GET | `/state` | 当前连接图、各构件可达性与最近试载、各支承点检修状态、连续传力保护对象、未消险事故及受影响名单 |
 | POST | `/snapshots` | 卸撑完成后固化验收快照 |
 | GET | `/snapshots`、`/snapshots/{id}` | 查询快照 |
 | GET | `/supports` `/components` `/replacements` `/connections` `/temp-supports` | 登记簿查询 |
@@ -115,6 +129,8 @@ docker compose up --build
 {"seq": 9, "action": "protect", "component": "C1"}
 // 解除保护（此后该构件回到普通施工期规则）
 {"seq": 10, "action": "unprotect", "component": "C1"}
+// 事故上报：已在位榫卯 J1 意外失效——保存真实连接状态与回执，不做整步回滚
+{"seq": 11, "action": "report_failure", "id": "J1"}
 ```
 
 ## 可执行调用示例
@@ -425,6 +441,119 @@ curl -X POST $B/steps -d '{"seq":11,"action":"remove_support","id":"T1"}'
 #   → 409 support_unreachable，first_affected_component=C1
 ```
 
+## 事故上报与分步补救：失效保存真实状态、未消险只许补救、验收受阻
+
+现场发现**已在位榫卯意外失效**时，沿现有 `/steps` 顺序用 `report_failure` 工序
+上报：断开该连接并**保存真实连接状态与回执**——即使断开后有构件失去施工期路径、
+或受保护构件失去永久路径，也不做整步回滚；受影响构件按登记序记入事故名单并
+持久保存（重启后仍在），`/state` 可查。断开使连接状态版本 +1（**旧试载失效**），
+登记/工序状态变化同时使**旧预案凭据失效**。**一次只处理一处失效**：未消险时
+只允许安装事先登记的连接或临时支撑，每步受影响名单不得新增成员、可逐步救回；
+**受保护构件只能靠永久连接恢复**。名单清空即消险、恢复通常工序；期间试载、
+卸撑与验收快照一律 409 `incident_active` 拒绝，**拒绝不改状态或工序号**。
+补救安装也可列入预案清单走预演/确认，逐步遵守同一规则，失败仍整单回滚。
+
+一键执行（含断言，请在空库上跑，例如 `docker compose up --build` 后的全新卷）：
+
+```bash
+./demo_incident.sh
+```
+
+逐条手动执行（空库）：
+
+```bash
+B=http://localhost:8080
+
+# 1) 登记：C1 仅经 J1 落在 S1；C2 仅经 J2(C1—C2) 搭在 C1 上；
+#    J3(S2—C1)、J4(S2—C2) 为预登记备用永久路径；T1/T2 为临时支撑
+curl -X POST $B/supports      -d '{"id":"S1","name":"北柱础"}'
+curl -X POST $B/supports      -d '{"id":"S2","name":"南台基"}'
+curl -X POST $B/components    -d '{"id":"C1","name":"承重梁","min_load":10}'
+curl -X POST $B/components    -d '{"id":"C2","name":"小金柱","min_load":8}'
+curl -X POST $B/connections   -d '{"id":"J1","a":"S1","b":"C1"}'
+curl -X POST $B/connections   -d '{"id":"J2","a":"C1","b":"C2"}'
+curl -X POST $B/connections   -d '{"id":"J3","a":"S2","b":"C1","in_place":false}'
+curl -X POST $B/connections   -d '{"id":"J4","a":"S2","b":"C2","in_place":false}'
+curl -X POST $B/temp-supports -d '{"id":"T1","a":"S2","b":"C1"}'
+curl -X POST $B/temp-supports -d '{"id":"T2","a":"S2","b":"C2"}'
+curl -X POST $B/steps -d '{"seq":1,"action":"protect","component":"C2"}'        # 201 保护 C2
+curl -X POST $B/steps -d '{"seq":2,"action":"test_load","component":"C1","load":12}'  # 201（v0）
+
+# 2) 事故上报：J1 意外失效——保存真实连接状态与回执，不做整步回滚
+curl -X POST $B/steps -d '{"seq":3,"action":"report_failure","id":"J1"}'
+#   → 201 {"seq":3,"action":"report_failure",
+#          "result":{"connection":"J1","version":1,
+#                    "affected_components":["C1","C2"],"incident_active":true}}
+#     C1 失去施工期路径、受保护的 C2 失去永久路径，仍落回执；断开使版本 → v1，
+#     此前 v0 试载全部失效；事故状态持久保存，重启后仍在
+curl $B/state
+#   → "incident":{"connection":"J1","seq":3,"affected_components":["C1","C2"],...}
+#     按登记序列出受影响构件；connections 中 J1 "in_place":false（真实状态）
+
+# 3) 未消险期间：试载、卸撑、验收快照一律拒绝，拒绝不改状态或工序号
+curl -X POST $B/steps -d '{"seq":4,"action":"test_load","component":"C1","load":12}'
+#   → 409 incident_active（附 affected_components）
+curl -X POST $B/steps -d '{"seq":4,"action":"remove_support","id":"T1"}'
+#   → 409 incident_active
+curl -X POST $B/snapshots -d '{}'
+#   → 409 incident_active（验收受阻：受影响构件尚未全部救回，不能固化快照）
+curl -X POST $B/steps -d '{"seq":4,"action":"disassemble","target":"connection","id":"J2"}'
+#   → 409 incident_active（未消险时只允许安装已登记连接/临时支撑）
+curl -X POST $B/steps -d '{"seq":4,"action":"report_failure","id":"J2"}'
+#   → 409 incident_active（一次只处理一处失效）
+curl $B/state    # last_seq 仍 3、version 仍 v1：五次拒绝均不占号、不改状态
+
+# 4) 分步补救：临时支撑救回普通构件；受保护构件只能靠永久连接恢复
+curl -X POST $B/steps -d '{"seq":4,"action":"install","target":"temp_support","id":"T1"}'
+#   → 201 result.incident={"affected_components":["C2"],"active":true}
+#     C1 施工期路径恢复，名单缩小为 [C2]（每步不得新增成员，可逐步救回）
+curl -X POST $B/steps -d '{"seq":5,"action":"install","target":"temp_support","id":"T2"}'
+#   → 201 名单仍 ["C2"]：C2 受保护，临时支撑不能将其移出名单
+curl -X POST $B/steps -d '{"seq":6,"action":"install","target":"connection","id":"J3"}'
+#   → 201 result.incident={"affected_components":[],"active":false}
+#     C2 经 J2→C1→J3→S2 恢复永久路径，名单清空即消险（版本 → v2），恢复通常工序
+curl $B/state    # "incident":null
+
+# 5) 通常工序恢复：试载（v2）→ 卸撑 → 验收快照 1
+curl -X POST $B/steps -d '{"seq":7,"action":"test_load","component":"C1","load":12}'
+curl -X POST $B/steps -d '{"seq":8,"action":"test_load","component":"C2","load":9}'
+curl -X POST $B/steps -d '{"seq":9,"action":"remove_support","id":"T1"}'
+curl -X POST $B/steps -d '{"seq":10,"action":"remove_support","id":"T2"}'
+curl -X POST $B/snapshots -d '{}'          # 201 快照 1（v2）
+
+# 6) 再次失效：断开使旧预案凭据失效
+TOKEN=$(curl -s -X POST $B/plan/preview \
+  -d '{"steps":[{"action":"test_load","component":"C1","load":11}]}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+curl -X POST $B/steps -d '{"seq":11,"action":"report_failure","id":"J3"}'
+#   → 201 affected_components=["C1","C2"]（上一处已消险才允许再报；版本 → v3）
+curl -X POST $B/plan/confirm -d "{\"steps\":[{\"action\":\"test_load\",\"component\":\"C1\",\"load\":11}],\"token\":\"$TOKEN\"}"
+#   → 409 plan_stale：事故上报后登记/工序状态已变化，原凭据失效，不写入任何工序
+
+# 7) 事故中预案：逐步遵守同一规则，失败整单回滚；补救安装可预演、确认
+curl -X POST $B/plan/preview -d '{"steps":[
+  {"action":"install","target":"temp_support","id":"T1"},
+  {"action":"test_load","component":"C1","load":11}
+]}'
+#   → 409 incident_active，failed_step={"index":1,"seq":13,"action":"test_load"}
+#     未消险期间试载被拒，不签发凭据、预演不落库
+curl -X POST $B/plan/preview -d '{"steps":[{"action":"install","target":"connection","id":"J4"}]}'
+#   → 200 签发凭据；预演逐步可见装 J4 后名单清空、事故消险（预演本身不落库）
+TOKEN2=$(curl -s -X POST $B/plan/preview \
+  -d '{"steps":[{"action":"install","target":"connection","id":"J4"}]}' \
+  | python3 -c 'import json,sys;print(json.load(sys.stdin)["token"])')
+curl -X POST $B/plan/confirm -d "{\"steps\":[{\"action\":\"install\",\"target\":\"connection\",\"id\":\"J4\"}],\"token\":\"$TOKEN2\"}"
+#   → 201 整单落库（seq 12），名单清空消险（版本 → v4），恢复通常工序
+
+# 8) 断开使旧试载失效：须在当前版本下复验合格后再验收；已有快照保持可用
+curl -X POST $B/snapshots -d '{}'
+#   → 409 test_load_missing：v2 试载在 v4 下不被认可
+curl -X POST $B/steps -d '{"seq":13,"action":"test_load","component":"C1","load":12}'
+curl -X POST $B/steps -d '{"seq":14,"action":"test_load","component":"C2","load":9}'
+curl -X POST $B/snapshots -d '{}'          # 201 快照 2（v4）
+curl $B/snapshots/1                        # 快照 1 保持 v2 原样，不被事故与补救改写
+```
+
 ## 故障与修复示例：未安装替换件不得充当传力路径
 
 登记固定支承点 `S`、在位承重梁 `C`、**未安装**替换件 `R`，以及 `S—R`、`R—C`
@@ -504,6 +633,8 @@ curl $B/snapshots/1
 | `protected` | 连续传力保护期间不得拆卸该构件，须先按工序 `unprotect` 解除（附 `first_affected_component`） |
 | `protect_unreachable` | 构件当前无法仅凭在位永久连接抵达在用支承点（临时支撑不能替代），不能列为保护对象（附 `first_affected_component`） |
 | `support_inactive` | 支承点停用检修中，不得作为新装连接/临时支撑的端点（附 `support`） |
+| `incident_active` | 事故未消险：一次只处理一处失效，只允许安装事先登记的连接或临时支撑；试载、卸撑、验收快照等同理拒绝（附 `incident_connection`、`affected_components`），拒绝不改状态或工序号 |
+| `incident_widened` | 事故补救工序后受影响名单新增构件，补救期间不得扩大影响（附 `first_affected_component`） |
 | `unreachable` | 工序后（含试载、支承点停用时）构件无法经在位连接或临时支撑抵达在用固定支承点 |
 | `support_unreachable` | 卸撑后构件无法仅凭永久连接抵达支承点 |
 | `test_load_missing` | 构件缺少当前连接状态下通过的合格试载 |
@@ -524,5 +655,6 @@ demo_uninstalled_replacement.sh  # 未安装替换件虚假路径：故障复现
 demo_plan.sh        # 施工预案演示：预演 → 过期拒绝 → 一次写事务确认
 demo_maintenance.sh # 支承点检修演示：停用受阻 → 绕行 → 启用后复验 → 预案停启
 demo_protection.sh  # 连续传力保护演示：保护受阻 → 先接备用永久路径改接 → 解除后施工
+demo_incident.sh    # 事故演示：失效上报保存真实状态 → 未消险只许补救 → 消险复验再验收
 README.md
 ```
