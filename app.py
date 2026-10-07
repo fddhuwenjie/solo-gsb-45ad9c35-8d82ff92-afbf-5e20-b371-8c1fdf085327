@@ -24,8 +24,24 @@
   语义指出首个受影响构件、整步不留改动；须先接通备用永久路径（改接）后再拆旧路。
   保护变更（protect/unprotect）不改连接状态版本、不使试载失效，但纳入预案凭据
   指纹，旧凭据随之失效。
+- 现场事故 incidents：已在位榫卯意外失效时，沿现有 /steps 顺序以 report_failure
+  工序上报（占用连续工序号、留下真实回执）。上报即把该连接置为不在位并使连接
+  状态版本 +1（旧试载全部失效）、登记状态指纹随之变化（旧预案凭据失效），即使
+  断开后有构件失去施工期路径或受保护构件失去永久路径也照样保存真实连接状态，
+  并按登记顺序计算"受影响构件"名单（受保护构件按仅凭永久连接可达判定，其他
+  构件按施工期"连接或临时支撑"判定），随事故行持久保存。一次只处理一处失效：
+  事故未消险前再次上报一律 409 incident_open 拒绝。
+- 分步补救：事故未消险（名单非空）时只允许 install 事先登记的连接或临时支撑；
+  试载、卸撑、拆卸、装/拆构件、支承点停启、保护变更、验收快照等全部 409 拒绝，
+  拒绝不改状态、不占工序号。每步补救后重新计算名单，名单不得新增成员
+  （409 affected_expanded，整步回滚），可逐步救回；受保护构件只能靠永久连接
+  恢复（临时支撑救不回受保护成员）。名单清空的当步结束事故（closed_at），此后
+  恢复通常工序；事故记录整行持久保存，/state 展示未消险事故，/incidents 可查
+  全部事故。事故期间试载、卸撑与验收快照一律拒绝（快照为 409
+  incident_in_progress，且不固化任何内容）。
 - 工序回执 steps：按递增工序号提交 install / disassemble / test_load /
-  remove_support / deactivate_support / activate_support / protect / unprotect。
+  remove_support / deactivate_support / activate_support / protect / unprotect /
+  report_failure。
 
 校验规则
 --------
@@ -73,6 +89,10 @@
   整单，全部成功才保存并返回按序回执；任一步失败指出出错工序并回滚整单
   新增的工序、连接版本、临时支撑状态及试载（连同凭据消耗记录），旧回执、
   试载与验收快照不变。密钥随库持久化，重启后状态未变的预案仍可确认。
+  事故上报 report_failure 也可列入预案逐步预演/确认（逐步遵守事故期同一条
+  补救规则：未消险步只允许安装事先登记的连接或临时支撑、名单不得新增、
+  受保护构件只能靠永久连接救回、名单清空当步结束事故）；事故状态同样进入
+  凭据指纹，预演后现场状态变化即 plan_stale。
 """
 
 import hashlib
@@ -153,6 +173,21 @@ CREATE TABLE IF NOT EXISTS protections (
     component_id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL,
     seq INTEGER NOT NULL       -- 建立保护的工序号
+);
+CREATE TABLE IF NOT EXISTS incidents (
+    -- 现场事故：report_failure 工序上报的在位榫卯意外失效，一行一处。
+    -- 事故状态（含按登记顺序的受影响构件名单 affected JSON）全程持久保存；
+    -- 补救中每步覆盖 affected 与 last_seq；名单清空当步写 closed_at 结束事故。
+    -- 旧库启动自动建空表；一次只允许一处未消险事故（closed_at IS NULL 唯一）。
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT NOT NULL,   -- 意外失效（断开）的在位榫卯连接
+    report_seq INTEGER NOT NULL,   -- 上报工序号
+    reported_at TEXT NOT NULL,
+    initial_affected TEXT NOT NULL, -- JSON：上报时受影响构件（按登记顺序）
+    affected TEXT NOT NULL,        -- JSON：当前仍受影响构件（每步补救后覆盖）
+    last_seq INTEGER NOT NULL,     -- 最近一次名单更新所在工序号
+    closed_at TEXT,                -- 名单清空、事故结束时刻；NULL 表示未消险
+    closed_seq INTEGER             -- 结束事故的工序号
 );
 """
 
@@ -332,6 +367,53 @@ def _protected_ids(conn):
         "SELECT component_id FROM protections")}
 
 
+def _affected_components(conn):
+    """按登记顺序返回当前受影响构件（id, is_protected）列表。
+
+    - 受保护构件：无法仅凭当时在位的永久连接抵达某个在用固定支承点（临时支撑
+      不能替代唯一永久路径）；
+    - 其他在位构件：无法经在位连接或临时支撑（施工期路径）抵达在用支承点。
+    /steps 常规每道工序后的统一校验与事故上报、分步补救后的名单重算共用本函数，
+    保证同一连接状态下"首个/全部受影响构件"口径一致。
+    """
+    comps, sups, perm, temp = _graph(conn)
+    protected = _protected_ids(conn)
+    seen_perm = _reachable(sups, perm)
+    seen_all = _reachable(sups, perm + temp)
+    out = []
+    for c in comps:
+        if not c["in_place"]:
+            continue
+        if c["id"] in protected:
+            if c["id"] not in seen_perm:
+                out.append((c["id"], True))
+        elif c["id"] not in seen_all:
+            out.append((c["id"], False))
+    return out
+
+
+def _open_incident(conn):
+    """当前未消险事故行（closed_at IS NULL）；一次至多一处，无则 None。"""
+    return conn.execute(
+        "SELECT * FROM incidents WHERE closed_at IS NULL ORDER BY id").fetchone()
+
+
+def _incident_state(row):
+    """事故行 → /state 与 /incidents 共用的 JSON 形态。"""
+    return {
+        "id": row["id"],
+        "connection": row["connection_id"],
+        "report_seq": row["report_seq"],
+        "reported_at": row["reported_at"],
+        "initial_affected_components": json.loads(row["initial_affected"]),
+        "affected_components": json.loads(row["affected"]),
+        "last_seq": row["last_seq"],
+        "closed": row["closed_at"] is not None,
+        "closed_at": row["closed_at"],
+        "closed_seq": row["closed_seq"],
+    }
+
+
 def _check_after_step(conn):
     """每道工序结束时的统一传力校验（/steps 单步与预案预演/确认共用）。
 
@@ -340,29 +422,22 @@ def _check_after_step(conn):
       唯一永久路径（连接）或停用其唯一在用支承点，仍按原有 409 unreachable 语义
       指出首个受影响构件，整步不留改动——须先接通备用永久路径后再改接。
     - 其他在位构件沿用原施工期规则：经在位连接或临时支撑抵达支承点即可。
-    按构件登记序逐一判定，保证"首个受影响构件"确定且与原语义一致。
+    按构件登记序逐一判定（复用 _affected_components），保证"首个受影响构件"
+    确定且与原语义一致。
     """
-    comps, sups, perm, temp = _graph(conn)
-    protected = _protected_ids(conn)
-    seen_perm = _reachable(sups, perm)
-    seen_all = _reachable(sups, perm + temp)
-    for c in comps:
-        if not c["in_place"]:
-            continue
-        if c["id"] in protected:
-            if c["id"] not in seen_perm:
-                raise reject(
-                    "unreachable",
-                    f"本工序后受保护构件 {c['id']} 无法仅凭在位永久连接抵达在用"
-                    "固定支承点（临时支撑不能替代唯一永久路径），整步拒绝",
-                    component=c["id"],
-                )
-        elif c["id"] not in seen_all:
+    for cid, is_protected in _affected_components(conn):
+        if is_protected:
             raise reject(
                 "unreachable",
-                f"本工序后构件 {c['id']} 无法经在位连接或临时支撑抵达固定支承点，整步拒绝",
-                component=c["id"],
+                f"本工序后受保护构件 {cid} 无法仅凭在位永久连接抵达在用"
+                "固定支承点（临时支撑不能替代唯一永久路径），整步拒绝",
+                component=cid,
             )
+        raise reject(
+            "unreachable",
+            f"本工序后构件 {cid} 无法经在位连接或临时支撑抵达固定支承点，整步拒绝",
+            component=cid,
+        )
 
 
 def _get(conn, table, oid, what):
@@ -710,18 +785,114 @@ def _apply_unprotect(conn, body):
     return {"component": cid, "protected": False}
 
 
+def _apply_report_failure(conn, seq, body):
+    """现场上报：已在位榫卯意外失效（与人工 disassemble 相区别）。
+
+    沿现有 /steps 顺序提交，占用连续工序号并留下真实回执：把该连接置为不在位、
+    连接状态版本 +1（旧试载随之失效；登记/状态指纹变化使旧预案凭据失效）。
+    与常规拆卸不同——即使断开后有构件失去施工期路径，或受保护构件失去永久
+    路径，也照样保存真实连接状态，不做常规可达性整步拒绝；而是按登记顺序计算
+    受影响构件名单并随事故行持久保存。一次只处理一处失效：已有未消险事故时
+    再上报按 409 incident_open 拒绝（整步不留改动）。
+    """
+    existing = _open_incident(conn)
+    if existing is not None:
+        raise reject(
+            "incident_open",
+            f"事故 {existing['id']}（榫卯 {existing['connection_id']} 失效）尚未消险，"
+            "一次只处理一处失效：请先分步救回全部受影响构件，不能上报新事故",
+            incident=existing["id"],
+        )
+    oid = body.get("id")
+    row = _get(conn, "connections", oid, "连接")
+    if not row["in_place"]:
+        raise reject("not_in_place", f"连接 {oid} 当前不在位，不能作为在位榫卯意外失效上报")
+    conn.execute("UPDATE connections SET in_place=0 WHERE id=?", (oid,))
+    v = _bump(conn)   # 意外断开同样改变永久连接图：旧试载全部失效
+    affected = [cid for cid, _p in _affected_components(conn)]
+    ts = now()
+    cur = conn.execute(
+        "INSERT INTO incidents(connection_id, report_seq, reported_at,"
+        " initial_affected, affected, last_seq, closed_at, closed_seq)"
+        " VALUES(?,?,?,?,?,?,NULL,NULL)",
+        (oid, seq, ts,
+         json.dumps(affected, ensure_ascii=False),
+         json.dumps(affected, ensure_ascii=False), seq),
+    )
+    if not affected:
+        # 断开未使任何构件失去路径：记录事故并在当步即结束，恢复通常工序
+        conn.execute(
+            "UPDATE incidents SET closed_at=?, closed_seq=? WHERE id=?",
+            (ts, seq, cur.lastrowid))
+    return {
+        "incident": cur.lastrowid,
+        "connection": oid,
+        "endpoints": [row["a"], row["b"]],
+        "affected_components": affected,
+        "version": v,
+        "status": "closed" if not affected else "open",
+    }
+
+
 # 工序动作全集：/steps 单步与预案清单共用同一套校验
 _ACTIONS = ("install", "disassemble", "test_load", "remove_support",
-            "deactivate_support", "activate_support", "protect", "unprotect")
+            "deactivate_support", "activate_support", "protect", "unprotect",
+            "report_failure")
+
+# 事故未消险期间唯一允许的补救动作：安装事先登记的连接或临时支撑
+_REMEDY_ACTIONS = frozenset(("install",))
 
 
 def _apply_action(conn, seq, action, body):
     """按动作套用单步工序并返回执行结果。
 
-    所有工序套用后统一重建连接图做 _check_after_step：受保护构件须仅凭在位
-    永久连接抵达在用支承点，其他构件经在位连接或临时支撑可达；卸撑另在自身
-    函数内做更严的永久路径 + 当前版本合格试载校验。
+    现场事故闸门（/steps 单步与预案预演/确认完全一致）：
+    - report_failure：保存真实断开状态（不做常规可达性拒绝），登记或结束事故，
+      本函数直接返回，不再走常规 _check_after_step；
+    - 已有未消险事故时，只允许 install 事先登记的连接或临时支撑（其他动作
+      409 incident_in_progress）；补救后重算名单，名单新增成员则 409
+      affected_expanded 整步回滚，名单只可逐步缩小；受保护构件只能靠永久连接
+      救回（名单按永久可达判定，临时支撑救不回受保护成员）；名单清空当步结束
+      事故。拒绝不改任何状态、不占工序号。
+    - 无未消险事故时沿用原规则：套用动作后统一 _check_after_step。
     """
+    incident = _open_incident(conn)
+    if action == "report_failure":
+        return _apply_report_failure(conn, seq, body)
+    if incident is not None:
+        if action not in _REMEDY_ACTIONS or body.get("target") not in (
+                "connection", "temp_support"):
+            raise reject(
+                "incident_in_progress",
+                f"事故 {incident['id']}（榫卯 {incident['connection_id']} 失效）"
+                "尚未消险：只允许安装事先登记的连接或临时支撑分步救回受影响构件，"
+                "试载、卸撑、拆卸、装拆构件、支承点停启、保护变更与验收快照一律拒绝",
+                incident=incident["id"],
+                affected_components=json.loads(incident["affected"]),
+            )
+        result = _apply_install(conn, body)
+        new_affected = [cid for cid, _p in _affected_components(conn)]
+        before = set(json.loads(incident["affected"]))
+        added = [cid for cid in new_affected if cid not in before]
+        if added:
+            raise reject(
+                "affected_expanded",
+                "本步补救后受影响名单出现新成员 " + "、".join(added)
+                + "：每步受影响名单不得新增成员，只能逐步救回，整步拒绝",
+                incident=incident["id"],
+                new_affected_components=added,
+            )
+        closed = not new_affected
+        ts = now() if closed else None
+        conn.execute(
+            "UPDATE incidents SET affected=?, last_seq=?, closed_at=?, closed_seq=?"
+            " WHERE id=?",
+            (json.dumps(new_affected, ensure_ascii=False), seq, ts,
+             seq if closed else None, incident["id"]))
+        result["incident"] = incident["id"]
+        result["affected_components"] = new_affected
+        result["incident_status"] = "closed" if closed else "open"
+        return result
     if action == "install":
         result = _apply_install(conn, body)
     elif action == "disassemble":
@@ -837,12 +1008,13 @@ def _table_fingerprint(conn, sql):
 
 
 def _plan_token(conn, items):
-    """确认凭据：以服务端持久密钥对"清单 + 当前登记/工序/保护状态"做 HMAC-SHA256。
+    """确认凭据：以服务端持久密钥对"清单 + 当前登记/工序/保护/事故状态"做 HMAC-SHA256。
 
     绑定清单、当前登记（支承点/构件/连接/临时支撑）、工序状态（连接状态
-    版本、工序回执、试载记录）与连续传力保护状态（protections）。密钥永不
-    下发，客户端无法自行伪造；清单或任一状态变化（含 protect/unprotect）都会使
-    重算结果不符。仅 /plan/preview 整单预演成功后签发。
+    版本、工序回执、试载记录）、连续传力保护状态（protections）与现场事故
+    状态（incidents）。密钥永不下发，客户端无法自行伪造；清单或任一状态变化
+    （含 protect/unprotect、事故上报与分步补救）都会使重算结果不符。仅
+    /plan/preview 整单预演成功后签发。
     """
     list_fp = hashlib.sha256(json.dumps(
         items, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
@@ -854,6 +1026,7 @@ def _plan_token(conn, items):
         _table_fingerprint(conn, "SELECT * FROM steps ORDER BY seq"),
         _table_fingerprint(conn, "SELECT * FROM test_loads ORDER BY id"),
         _table_fingerprint(conn, "SELECT * FROM protections ORDER BY rowid"),
+        _table_fingerprint(conn, "SELECT * FROM incidents ORDER BY id"),
         str(_version(conn)),
     ]).encode("utf-8")).hexdigest()
     mac = hmac.new(
@@ -954,6 +1127,16 @@ def create_snapshot(_body):
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # 事故未消险期间验收快照一律拒绝（且不固化任何内容）；拒绝不改状态/工序号
+        inc = _open_incident(conn)
+        if inc is not None:
+            raise reject(
+                "incident_in_progress",
+                f"事故 {inc['id']}（榫卯 {inc['connection_id']} 失效）尚未消险，"
+                "受影响构件未全部救回，不能固化验收快照",
+                incident=inc["id"],
+                affected_components=json.loads(inc["affected"]),
+            )
         left = [r["id"] for r in conn.execute(
             "SELECT id FROM temp_supports WHERE in_place=1 ORDER BY rowid")]
         if left:
@@ -1081,6 +1264,8 @@ def get_state():
         comps, sups, perm, temp = _graph(conn)
         v = _version(conn)
         protected = _protected_ids(conn)
+        inc = _open_incident(conn)
+        affected_set = set(json.loads(inc["affected"])) if inc is not None else set()
         seen_all = _reachable(sups, perm + temp)
         seen_perm = _reachable(sups, perm)
         comp_list = []
@@ -1094,6 +1279,7 @@ def get_state():
                 "id": c["id"], "name": c["name"], "min_load": c["min_load"],
                 "origin": c["origin"], "in_place": bool(c["in_place"]),
                 "protected": c["id"] in protected,
+                "affected": (c["id"] in affected_set) if c["in_place"] else False,
                 "reachable": c["id"] in seen_all if c["in_place"] else None,
                 "permanent_reachable": c["id"] in seen_perm if c["in_place"] else None,
                 "last_test": dict(t) if t else None,
@@ -1120,7 +1306,31 @@ def get_state():
             "connections": joints,
             "temp_supports": shores,
             "protections": prot,
+            # 未消险现场事故：受影响构件按登记顺序列在 incident.affected_components
+            # （components 各行另以 affected 字段标记）；无事故时为 null
+            "incident": _incident_state(inc) if inc is not None else None,
         }
+    finally:
+        conn.close()
+
+
+def list_incidents():
+    conn = connect()
+    try:
+        rows = [_incident_state(r) for r in conn.execute(
+            "SELECT * FROM incidents ORDER BY id")]
+        return 200, rows
+    finally:
+        conn.close()
+
+
+def get_incident(iid):
+    conn = connect()
+    try:
+        r = conn.execute("SELECT * FROM incidents WHERE id=?", (iid,)).fetchone()
+        if r is None:
+            raise ApiError(404, "not_found", f"事故 {iid} 不存在")
+        return 200, _incident_state(r)
     finally:
         conn.close()
 
@@ -1162,11 +1372,12 @@ def route(method, path, body):
                 "POST /connections         登记榫卯连接（允许的端点组合）",
                 "POST /temp-supports       登记临时支撑",
                 "POST /replacements        登记替换件",
-                "POST /steps               按递增工序号提交拆卸/安装/试载/卸撑/支承点停启/保护解除回执",
+                "POST /steps               按递增工序号提交拆卸/安装/试载/卸撑/支承点停启/保护解除/事故上报回执",
                 "POST /plan/preview         预演工序清单：整单成功后签发服务端密钥保护的凭据（不留改动）",
                 "POST /plan/confirm         凭据确认：写事务内验签并复核整单，凭据整单仅可用一次",
                 "GET  /steps | /steps/{n}  查询各工序回执与结果",
-                "GET  /state               当前连接图与各构件状态",
+                "GET  /state               当前连接图、各构件状态与未消险事故受影响名单",
+                "GET  /incidents | /incidents/{id}  查询现场事故（持久保存，含已消险）",
                 "POST /snapshots           卸撑完成后固化验收快照（只增不改）",
                 "GET  /snapshots | /snapshots/{id}",
             ],
@@ -1207,6 +1418,11 @@ def route(method, path, body):
         return get_step(int(m.group(1)))
     if method == "GET" and path == "/state":
         return get_state()
+    if method == "GET" and path == "/incidents":
+        return list_incidents()
+    m = re.fullmatch(r"/incidents/(\d+)", path)
+    if method == "GET" and m:
+        return get_incident(int(m.group(1)))
     if method == "GET" and path == "/snapshots":
         return list_snapshots()
     m = re.fullmatch(r"/snapshots/(\d+)", path)
